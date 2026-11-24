@@ -127,6 +127,9 @@ def _audio_kecil(file: Path, a: float, lama: float, out: Path) -> tuple[Path, st
     raise RuntimeError("Gagal mengekstrak audio untuk Gemini.")
 
 
+_KUOTA_HABIS: set[str] = set()  # model yang sudah 429 di proses ini → potongan berikutnya tidak mencobanya lagi
+
+
 def _minta_gemini(klien, urutan: list[str], data: bytes, mime: str, lama: float, bahasa: str | None) -> list[dict]:
     from google.genai import errors as gerr, types as gtypes
     bhs = {"id": "bahasa Indonesia", "en": "English"}.get(bahasa or "", bahasa or "bahasa aslinya")
@@ -140,8 +143,14 @@ def _minta_gemini(klien, urutan: list[str], data: bytes, mime: str, lama: float,
     cfg = gtypes.GenerateContentConfig(response_mime_type="application/json", response_schema=skema, temperature=0)
     isi = [gtypes.Part.from_bytes(data=data, mime_type=mime), prompt]
     pesan = ""
-    # 503/429 (server penuh) sering sesaat: dua putaran semua model dengan jeda makin panjang
-    for putaran, model in [(p, m) for p in range(2) for m in urutan]:
+    import os
+    # 503/429 (server penuh) sering sesaat: dua putaran semua model dengan jeda makin panjang.
+    # Model yang 429 (kuota habis) dilewati untuk sisa proses; 503 dicoba ulang. GEMINI_CEPAT=1 (web): jeda lebih pendek.
+    cepat = os.environ.get("GEMINI_CEPAT") == "1"
+    coba_urut = [m for m in urutan if m not in _KUOTA_HABIS] or urutan
+    for putaran, model in [(p, m) for p in range(2) for m in coba_urut]:
+        if model in _KUOTA_HABIS:
+            continue
         for coba in range(2):
             try:
                 r = klien.models.generate_content(model=model, contents=isi, config=cfg)
@@ -154,10 +163,15 @@ def _minta_gemini(klien, urutan: list[str], data: bytes, mime: str, lama: float,
                     raise RuntimeError(f"Kunci Gemini ditolak ({e.code}). Cek kuncinya.") from e
                 if e.code == 404:
                     break  # model tidak ada → model berikutnya
+                if e.code == 429:
+                    _KUOTA_HABIS.add(model)
+                if e.code == 429:
+                    log(f"Gemini {model}: kuota habis, pindah model…")
+                    break  # kuota per model → model lain (model lite sering masih tersedia)
             except (ValueError, json.JSONDecodeError) as e:
                 pesan = f"{model}: jawaban bukan JSON ({e})"
             log(f"Gemini belum berhasil ({pesan[:90]}), mencoba lagi…")
-            time.sleep(5 + coba * 10 + putaran * 30)
+            time.sleep((4 + coba * 6 + putaran * 10) if cepat else 5 + coba * 10 + putaran * 30)
     raise RuntimeError(f"Transkripsi Gemini gagal: {pesan}")
 
 

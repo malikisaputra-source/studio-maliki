@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -51,8 +52,17 @@ def muat():
     return m
 
 
+# Tanpa rekaman/deskripsi, VoxCPM memilih suara acak yang sering berlogat Inggris (laporan pengguna 21–24 Nov).
+# Deskripsi bawaan ini mengarahkan ke penutur asli bahasa Indonesia; bisa diganti lewat VOXCPM_DESAIN_BAWAAN.
+DESAIN_BAWAAN = os.environ.get("VOXCPM_DESAIN_BAWAAN") or (
+    "A native Indonesian speaker with a natural Indonesian accent, speaking fluent Bahasa Indonesia, "
+    "clear, warm and friendly narrator voice")
+
+
 def buat(model, teks: str, keluar: Path, referensi: str | None, desain: str | None, seed: int) -> float:
     import soundfile as sf
+    if not referensi and not desain:
+        desain = DESAIN_BAWAAN
     isi = f"({desain}){teks}" if desain else teks
     import torch
     torch.manual_seed(seed)  # versi voxcpm terpasang belum menerima argumen seed (README terbaru menyebutnya)

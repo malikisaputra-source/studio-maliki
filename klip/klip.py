@@ -52,12 +52,28 @@ def muat_transkrip(file: Path, a, kerja: Path) -> list[Kalimat]:
         log(f"Memakai subtitle dari {Path(a.subtitle_file).name}.")
         return baca_srt(Path(a.subtitle_file))
     mesin = getattr(a, "transkrip", "whisper") or "whisper"
-    cache = kerja / f"transkrip-{file.stem}-{'gemini' if mesin == 'gemini' else a.model}.json"
+    # --rentang berakhir sebelum video selesai → transkripsi hanya sampai batas itu (video panjang jauh lebih cepat)
+    awal, akhir = 0.0, None
+    if getattr(a, "rentang", None):
+        panjang = info_video(file)[0]
+        ra, rb = baca_rentang(a.rentang, panjang)
+        if panjang and (ra > 5 or rb < panjang - 5):
+            awal, akhir = max(0.0, ra - 2), min(panjang, rb + 2)  # sedikit lebih lebar supaya kalimat di tepi utuh
+    akhiran = f"-{int(awal)}-{int(akhir)}" if akhir else ""
+    cache = kerja / f"transkrip-{file.stem}-{'gemini' if mesin == 'gemini' else a.model}{akhiran}.json"
     if cache.exists():
         log("Transkrip diambil dari cache.")
         return [Kalimat(k["mulai"], k["selesai"], k["teks"], [Kata(**x) for x in k["kata"]])
                 for k in json.loads(cache.read_text(encoding="utf-8"))]
     bahasa = None if a.bahasa in ("auto", "", None) else a.bahasa
+    if akhir:
+        potong = kerja / f"potong{akhiran}.mp4"
+        if not potong.exists():  # potong ulang (bukan -c copy) supaya titik awal tepat → waktu subtitle tidak bergeser
+            subprocess.run([ffmpeg(), "-v", "error", "-y", "-ss", f"{awal:.2f}", "-i", str(file), "-t", f"{akhir - awal:.2f}",
+                            "-vf", "scale=-2:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                            "-c:a", "aac", "-b:a", "96k", str(potong)], check=True)
+        log(f"Transkripsi hanya menit {awal / 60:.0f}–{akhir / 60:.0f}.")
+        file = potong
     if mesin == "gemini":
         try:
             kal = transkrip_gemini(file, bahasa, kerja, getattr(a, "kunci_gemini", None))
@@ -65,6 +81,11 @@ def muat_transkrip(file: Path, a, kerja: Path) -> list[Kalimat]:
             sys.exit(str(e))
     else:
         kal = transkrip(file, a.model, bahasa)
+    if awal:
+        for k in kal:
+            k.mulai, k.selesai = round(k.mulai + awal, 3), round(k.selesai + awal, 3)
+            for w in k.kata:
+                w.mulai, w.selesai = round(w.mulai + awal, 3), round(w.selesai + awal, 3)
     cache.write_text(json.dumps([asdict(k) for k in kal], ensure_ascii=False), encoding="utf-8")
     return kal
 
