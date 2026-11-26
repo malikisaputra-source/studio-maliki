@@ -25,6 +25,7 @@ Contoh:
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -66,6 +67,23 @@ def muat_transkrip(file: Path, a, kerja: Path) -> list[Kalimat]:
         return [Kalimat(k["mulai"], k["selesai"], k["teks"], [Kata(**x) for x in k["kata"]])
                 for k in json.loads(cache.read_text(encoding="utf-8"))]
     bahasa = None if a.bahasa in ("auto", "", None) else a.bahasa
+    sub_yt = sorted(kerja.glob("sumber*.json3"))
+    if sub_yt and os.environ.get("KLIP_SUB_YT") == "1":
+        kal = baca_json3(sub_yt[0])
+        g = getattr(a, "_geser", 0.0)
+        if g:  # subtitle YouTube memakai waktu video utuh; file hanya potongan
+            for k in kal:
+                k.mulai, k.selesai = round(k.mulai - g, 3), round(k.selesai - g, 3)
+                for w in k.kata:
+                    w.mulai, w.selesai = round(w.mulai - g, 3), round(w.selesai - g, 3)
+            kal = [k for k in kal if k.mulai >= 0]
+        kal = [k for k in kal if not akhir or (k.selesai > awal and k.mulai < akhir)]
+        if len(kal) >= 5:
+            log(f"Memakai subtitle otomatis YouTube ({len(kal)} kalimat): transkripsi dilewati.")
+            a._sub_yt = True
+            cache.write_text(json.dumps([asdict(k) for k in kal], ensure_ascii=False), encoding="utf-8")
+            return kal
+    t0 = time.time()
     if akhir:
         potong = kerja / f"potong{akhiran}.mp4"
         if not potong.exists():  # potong ulang (bukan -c copy) supaya titik awal tepat → waktu subtitle tidak bergeser
@@ -81,6 +99,7 @@ def muat_transkrip(file: Path, a, kerja: Path) -> list[Kalimat]:
             sys.exit(str(e))
     else:
         kal = transkrip(file, a.model, bahasa)
+    log(f"Transkripsi selesai ({time.time() - t0:.0f} dtk).")
     if awal:
         for k in kal:
             k.mulai, k.selesai = round(k.mulai + awal, 3), round(k.selesai + awal, 3)
@@ -90,11 +109,96 @@ def muat_transkrip(file: Path, a, kerja: Path) -> list[Kalimat]:
     return kal
 
 
+def bagi_segmen(kal: list, a) -> list[list]:
+    """Mode live/VOD panjang: transkrip dibagi per SEGMEN menit supaya AI membaca semuanya dengan teliti
+    (satu prompt raksasa membuat momen di tengah-tengah sering terlewat)."""
+    if not kal:
+        return [kal]
+    menit = float(getattr(a, "segmen", 0) or 0)
+    if menit < 0:
+        return [kal]
+    rentang = kal[-1].selesai - kal[0].mulai
+    if menit <= 0:  # otomatis: hanya untuk video di atas 40 menit
+        if rentang <= 40 * 60:
+            return [kal]
+        menit = 20
+    lebar = menit * 60
+    hasil, awal = [], kal[0].mulai
+    while awal < kal[-1].selesai:
+        isi = [k for k in kal if k.mulai >= awal and k.mulai < awal + lebar]
+        if isi:
+            hasil.append(isi)
+        awal += lebar
+    if len(hasil) > 1 and sum(k.selesai - k.mulai for k in hasil[-1]) < lebar * 0.25:
+        hasil[-2] += hasil.pop()  # sisa pendek digabung ke segmen sebelumnya
+    return hasil
+
+
+def tanya_per_segmen(penyedia: str, segmen: list[list], a, kerja: Path, heatmap: list) -> dict:
+    per = max(2, -(-a.jumlah // len(segmen)) + 1)  # kandidat per segmen, sedikit lebih banyak dari kebutuhan
+    calon, ringkasan, hashtag = [], [], []
+    for i, isi in enumerate(segmen, 1):
+        log(f"Mode video panjang: segmen {i}/{len(segmen)} ({isi[0].mulai / 60:.0f}–{isi[-1].selesai / 60:.0f} mnt), "
+            f"meminta {per} kandidat ke AI '{penyedia}'…")
+        f = kerja / f"prompt-segmen-{i:02d}.md"
+        tulis_prompt(isi, a.durasi, per, f, a.arahan)
+        try:
+            data = ambil_json(tanya_ai(penyedia, f.read_text(encoding="utf-8")))
+        except Exception as e:  # noqa: BLE001 — satu segmen gagal tidak menggagalkan semuanya
+            log(f"Segmen {i} dilewati: {e}")
+            continue
+        if isinstance(data, dict):
+            if data.get("ringkasan"):
+                ringkasan.append(data["ringkasan"])
+            hashtag += [t for t in data.get("hashtag", []) if t not in hashtag]
+            data = data.get("klip", [])
+        for d in data or []:
+            try:
+                d["mulai"], d["selesai"] = float(d["mulai"]), float(d["selesai"])
+                if d["selesai"] <= d["mulai"]:
+                    continue
+                d["skor"] = float(d.get("skor", 0) or 0) + (0.3 * nilai_heatmap(heatmap, float(d["mulai"]), float(d["selesai"]))
+                                                             if heatmap else 0)
+                calon.append(d)
+            except (KeyError, TypeError, ValueError):
+                pass
+    if not calon:
+        sys.exit("AI tidak mengembalikan momen dari segmen mana pun.")
+    pilih = []
+    for d in sorted(calon, key=lambda x: -x["skor"]):  # ambil skor tertinggi, tanpa tumpang tindih
+        if all(float(d["selesai"]) <= float(p["mulai"]) or float(d["mulai"]) >= float(p["selesai"]) for p in pilih):
+            pilih.append(d)
+        if len(pilih) >= a.jumlah:
+            break
+    log(f"Mode video panjang: {len(calon)} kandidat dari {len(segmen)} segmen → {len(pilih)} klip terbaik.")
+    return {"ringkasan": " ".join(ringkasan[:2]), "hashtag": hashtag[:5],
+            "klip": sorted(pilih, key=lambda x: float(x["mulai"]))}
+
+
 def analisis(a, keluar: Path, kerja: Path) -> None:
+    bagian = None
+    if a.rentang and re.match(r"^https?://", a.sumber) and os.environ.get("KLIP_UNDUH_BAGIAN") == "1":
+        try:
+            r0, r1 = (detik(x.strip()) for x in a.rentang.split("-", 1))
+            bagian = (max(0.0, r0), r1) if r1 > r0 else None
+        except ValueError:
+            bagian = None
+    sudah_ada = any(f.suffix in (".mp4", ".mkv", ".webm") for f in kerja.glob("sumber.*"))
     try:
-        file, heatmap, judul = ambil_sumber(a.sumber, kerja)
+        file, heatmap, judul = ambil_sumber(a.sumber, kerja, None if sudah_ada else bagian)
     except RuntimeError as e:
         sys.exit(str(e))
+    geser = 0.0
+    if bagian and (kerja / "bagian.json").exists() or (bagian and not sudah_ada):
+        if not sudah_ada:
+            (kerja / "bagian.json").write_text(json.dumps(list(bagian)), encoding="utf-8")
+        geser = float(json.loads((kerja / "bagian.json").read_text(encoding="utf-8"))[0])
+    if geser:
+        # file hanya berisi potongan → semua waktu digeser supaya 0 = awal potongan
+        heatmap = [{**x, "start_time": x["start_time"] - geser, "end_time": x["end_time"] - geser}
+                   for x in heatmap if x.get("end_time", 0) > geser]
+        a._geser = geser
+        a.rentang = None
     panjang, w, h = info_video(file)
     log(f"Video: {judul} — {panjang:.0f} detik, {w}x{h}. Heatmap YouTube: {'ada' if heatmap else 'tidak ada'}.")
     semua = muat_transkrip(file, a, kerja)
@@ -117,9 +221,13 @@ def analisis(a, keluar: Path, kerja: Path) -> None:
             data = json.loads(Path(a.pilihan).read_text(encoding="utf-8"))
             sumber_ai = "pilihan.json"
         else:
-            log(f"Meminta AI '{penyedia}' memilih momen…")
-            tulis_prompt(kal, a.durasi, a.jumlah, kerja / "prompt.md", a.arahan)
-            data = ambil_json(tanya_ai(penyedia, (kerja / "prompt.md").read_text(encoding="utf-8")))
+            segmen = bagi_segmen(kal, a)
+            if len(segmen) > 1:
+                data = tanya_per_segmen(penyedia, segmen, a, kerja, heatmap)
+            else:
+                log(f"Meminta AI '{penyedia}' memilih momen…")
+                tulis_prompt(kal, a.durasi, a.jumlah, kerja / "prompt.md", a.arahan)
+                data = ambil_json(tanya_ai(penyedia, (kerja / "prompt.md").read_text(encoding="utf-8")))
             sumber_ai = penyedia
         if isinstance(data, dict):
             ringkasan, hashtag = data.get("ringkasan", ""), data.get("hashtag", [])
@@ -153,6 +261,23 @@ def analisis(a, keluar: Path, kerja: Path) -> None:
             hk = (kena[0] if kena else (isi[0] if isi else k)).mulai
         daftar.append({**asdict(k), "no": i, "hook": round(float(hk), 1), "file": ""})
 
+    if (os.environ.get("SELARAS_NANTI") == "1" and getattr(a, "transkrip", "") == "gemini"
+            and not getattr(a, "_sub_yt", False) and daftar):
+        t0 = time.time()
+        jangkar = []  # (indeks kalimat pertama, terakhir, selisih awal, selisih akhir) per klip, dari waktu kasar
+        for d in daftar:
+            isi = [i for i, x in enumerate(kal) if x.selesai > d["mulai"] and x.mulai < d["selesai"]]
+            jangkar.append((isi[0], isi[-1], d["mulai"] - kal[isi[0]].mulai, d["selesai"] - kal[isi[-1]].selesai)
+                           if isi else None)
+        ok = selaraskan_bagian(file, kal, [(d["mulai"], d["selesai"]) for d in daftar])
+        for d, j in zip(daftar, jangkar):  # geser batas klip mengikuti kalimat yang sudah diselaraskan
+            if j:
+                geser = kal[j[0]].mulai + j[2] - d["mulai"]
+                d["mulai"] = round(max(0.0, kal[j[0]].mulai + j[2]), 2)
+                d["selesai"] = round(kal[j[1]].selesai + j[3], 2)
+                d["hook"] = round(float(d["hook"]) + geser, 1)
+        log(f"Waktu subtitle klip diselaraskan ({ok} kalimat, {time.time() - t0:.0f} dtk).")
+
     try:
         en = energi_audio(file)
         langkah = max(len(en) // 120, 1)
@@ -178,6 +303,21 @@ def analisis(a, keluar: Path, kerja: Path) -> None:
     (keluar / "klip.json").write_text(json.dumps(daftar, ensure_ascii=False, indent=2), encoding="utf-8")
     (keluar / "transkrip.json").write_text(json.dumps([asdict(k) for k in kal], ensure_ascii=False), encoding="utf-8")
     log(f"Analisis selesai: {len(daftar)} momen.")
+
+
+def siapkan_unggahan(keluar: Path, d: dict, info: dict) -> None:
+    """Sampul (bingkai saat judul pembuka tampil) + teks unggahan siap tempel untuk satu klip."""
+    mp4 = keluar / d["file"]
+    sampul = mp4.with_name(mp4.stem + "-sampul.jpg")
+    detik = 1.2 if (d["selesai"] - d["mulai"]) > 2 else 0
+    r = subprocess.run([ffmpeg(), "-v", "error", "-y", "-ss", str(detik), "-i", str(mp4), "-frames:v", "1",
+                        "-q:v", "3", str(sampul)], capture_output=True)
+    if r.returncode == 0 and sampul.exists():
+        d["sampul"] = sampul.name
+    tag = [t for t in (info.get("hashtag") or []) if t not in (d.get("caption") or "")]
+    teks = "\n\n".join(x for x in (d.get("judul", ""), (d.get("caption") or "").strip(), " ".join(tag)) if x)
+    (mp4.with_name(mp4.stem + "-unggahan.txt")).write_text(teks + "\n", encoding="utf-8")
+    d["teks_unggahan"] = mp4.stem + "-unggahan.txt"
 
 
 def render_terpilih(keluar: Path, kerja: Path, pilih: str | None, gaya: dict) -> None:
@@ -211,6 +351,7 @@ def render_terpilih(keluar: Path, kerja: Path, pilih: str | None, gaya: dict) ->
             d["kredit"] = kredit
             if kredit not in (d.get("caption") or ""):
                 d["caption"] = ((d.get("caption") or "") + f"\n{kredit}").strip()
+        siapkan_unggahan(keluar, d, info)
         (keluar / "klip.json").write_text(json.dumps(daftar, ensure_ascii=False, indent=2), encoding="utf-8")
     (keluar / "gaya.json").write_text(json.dumps(gaya, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"Selesai. {len(target)} klip di {keluar}")
@@ -233,6 +374,8 @@ def main() -> None:
     p.add_argument("--warna", default=None, help="warna sorot subtitle (hex); kosong = warna preset")
     p.add_argument("--hanya-prompt", action="store_true", help="Opsi B: tulis prompt Claude lalu berhenti")
     p.add_argument("--pilihan", help="Opsi B: JSON momen dari Claude")
+    p.add_argument("--segmen", type=float, default=0,
+                   help="mode live/VOD panjang: analisis AI per N menit (0 = otomatis untuk video > 40 menit, -1 = mati)")
     p.add_argument("--arahan", default="", help="momen yang dicari, mis. 'momen lucu' atau 'tips praktis'")
     p.add_argument("--ai", default=None, help="pemilih momen: lokal (default), gemini, openai (Ollama dll.), "
                         "claude-code (langganan Claude), codex (langganan ChatGPT), opencode")

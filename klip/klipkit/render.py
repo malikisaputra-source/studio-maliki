@@ -629,5 +629,8 @@ def render(file: Path, klip: Klip, kal: list[Kalimat], out: Path, kerja: Path, w
         ffmpeg(), "-y", "-v", "error", *masukan,
         "-filter_complex", ";".join(graf + aud), "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        # KLIP_THREADS (server): batasi inti per render supaya beberapa pengguna tidak saling memperlambat
+        *(["-threads", __import__("os").environ["KLIP_THREADS"], "-filter_complex_threads", __import__("os").environ["KLIP_THREADS"]]
+          if __import__("os").environ.get("KLIP_THREADS") else []),
         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out.resolve()),
     ], check=True, cwd=kerja)

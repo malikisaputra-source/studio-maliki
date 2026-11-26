@@ -19,6 +19,7 @@ DIBLOKIR = ("not a bot", "sign in to confirm", "confirm your age", "login_requir
 PESAN_BLOKIR = ("YouTube meminta verifikasi (\"bukan bot\") dan menolak unduhan dari koneksi ini. Coba: matikan VPN/proxy, "
                 "buka youtube.com di Firefox/Chrome dan pastikan sudah login lalu ulangi, ganti jaringan (Wi-Fi/hotspot), "
                 "atau unduh videonya sendiri dan seret file-nya ke Studio.")
+PESAN_BLOKIR = __import__("os").environ.get("KLIP_PESAN_BLOKIR") or PESAN_BLOKIR  # Clipper web: pesan khusus server
 
 
 def _browser_cookies() -> list[str]:
@@ -26,6 +27,8 @@ def _browser_cookies() -> list[str]:
     cookies (app-bound) sehingga sering tidak terbaca."""
     import os
     pilih = os.environ.get("KLIP_COOKIES_BROWSER")
+    if pilih == "-":
+        return []
     if pilih:
         return [b.strip() for b in pilih.split(",") if b.strip()]
     if sys.platform == "darwin":
@@ -76,21 +79,45 @@ def _runtime_js() -> dict:
     return rt
 
 
-def ambil_sumber(sumber: str, kerja: Path) -> tuple[Path, list[dict], str]:
-    """Kembalikan (file video, heatmap YouTube atau [], judul)."""
+def ambil_sumber(sumber: str, kerja: Path, bagian: tuple[float, float] | None = None) -> tuple[Path, list[dict], str]:
+    """Kembalikan (file video, heatmap YouTube atau [], judul). `bagian` (detik) = unduh hanya potongan itu
+    (KLIP_UNDUH_BAGIAN=1); waktu di file hasil dimulai dari 0 = awal potongan."""
     if re.match(r"^https?://", sumber):
+        import os
         import yt_dlp
-        log("Mengunduh video (maks 1080p) dengan yt-dlp…")
+        tinggi = int(os.environ.get("KLIP_MAKS_TINGGI", "1080"))
+        log(f"Mengunduh video (maks {tinggi}p) dengan yt-dlp…")
+        t0 = time.time()
         opsi = {
             "outtmpl": str(kerja / "sumber.%(ext)s"),
-            "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b",
+            "format": f"bv*[height<={tinggi}][ext=mp4]+ba[ext=m4a]/b[height<={tinggi}][ext=mp4]/b",
             "merge_output_format": "mp4",
             "ffmpeg_location": ffmpeg(),
             "quiet": True, "no_warnings": True, "noprogress": True,
             "js_runtimes": _runtime_js(),  # yt-dlp butuh runtime JS untuk tantangan YouTube
         }
+        if os.environ.get("KLIP_SUB_YT") == "1":  # subtitle otomatis YouTube (waktu per kata) → lewati transkripsi
+            opsi.update(writeautomaticsub=True, writesubtitles=True, subtitlesformat="json3",
+                        subtitleslangs=["id", "id-orig", "in"])
+        if bagian and os.environ.get("KLIP_UNDUH_BAGIAN") == "1":
+            from yt_dlp.utils import download_range_func
+            # yt-dlp mencari biner bernama "ffmpeg" untuk unduhan sebagian; ffmpeg bawaan imageio bernama lain
+            bin_ = kerja / "bin"
+            bin_.mkdir(exist_ok=True)
+            nama = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+            if not (bin_ / nama).exists():
+                try:
+                    (bin_ / nama).symlink_to(ffmpeg())
+                except OSError:
+                    import shutil
+                    shutil.copy(ffmpeg(), bin_ / nama)
+            opsi["ffmpeg_location"] = str(bin_)
+            os.environ["PATH"] = str(bin_) + os.pathsep + os.environ.get("PATH", "")  # cek ketersediaan yt-dlp lewat PATH
+            opsi["download_ranges"] = download_range_func(None, [bagian])
+            log(f"Hanya mengunduh menit {bagian[0] / 60:.0f}–{bagian[1] / 60:.0f}.")
         info = _unduh(yt_dlp, sumber, opsi)
-        file = next(kerja.glob("sumber.*"))
+        file = next(f for f in kerja.glob("sumber.*") if f.suffix in (".mp4", ".mkv", ".webm", ".mov"))
+        log(f"Unduhan selesai ({time.time() - t0:.0f} dtk).")
         return file, info.get("heatmap") or [], info.get("title") or "video"
     p = Path(sumber).expanduser().resolve()
     if not p.exists():

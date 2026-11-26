@@ -473,11 +473,18 @@ def mulai_render_klip(d: dict) -> dict:
     gaya["broll_file"] = [str(DATA / "aset" / Path(x).name) for x in (gaya.get("broll_file") or [])
                           if (DATA / "aset" / Path(x).name).exists()]
     # judul banner hasil suntingan pengguna
-    if d.get("judul"):
+    if d.get("judul") or d.get("caption") or d.get("batas"):
         daftar = json.loads((folder / "klip.json").read_text(encoding="utf-8"))
         for x in daftar:
-            if str(x["no"]) in d["judul"]:
-                x["judul_banner"] = d["judul"][str(x["no"])]
+            n = str(x["no"])
+            if n in (d.get("judul") or {}):
+                x["judul_banner"] = d["judul"][n]
+            if (d.get("caption") or {}).get(n):
+                x["caption"] = str(d["caption"][n])[:2200]
+            b = (d.get("batas") or {}).get(n)
+            if b and len(b) == 2 and 3 <= float(b[1]) - float(b[0]) <= 600:
+                x["mulai"], x["selesai"] = round(max(0.0, float(b[0])), 2), round(float(b[1]), 2)
+                x.pop("jejak", None)  # jejak wajah lama tidak cocok dengan batas baru
         (folder / "klip.json").write_text(json.dumps(daftar, ensure_ascii=False, indent=2), encoding="utf-8")
     (folder / "gaya-permintaan.json").write_text(json.dumps(gaya, ensure_ascii=False), encoding="utf-8")
     cmd = [*jalankan_skrip(KLIP / "klip.py"), "--render", "--keluar", str(folder),

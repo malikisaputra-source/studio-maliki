@@ -346,6 +346,7 @@ select.input option{background:var(--panel);color:var(--teks)}
 .item .hapus{position:absolute;top:12px;right:12px;opacity:0;transition:opacity .2s}
 .item:hover .hapus{opacity:1}
 @media (max-width:1100px){.analisis,.studio-render{grid-template-columns:1fr}.kiri-lekat,.ponsel{position:static}}
+.lencana.geser button{all:unset;cursor:pointer;padding:0 5px;opacity:.55}.lencana.geser button:hover{opacity:1}
 .kredit{font-size:12px;line-height:1.5;color:var(--redup2);padding:10px 12px 2px;-webkit-app-region:no-drag}.kredit b{color:var(--redup);font-weight:600}
 @media (max-width:1100px){.kredit{display:none}}
 /* ── Audit 14 Nov: fokus, rail, status proses, mode hasil Klip, menu ekspor ── */
@@ -1164,12 +1165,18 @@ const LK = {
   render: [['SIAPKAN', /Render 1\//], ['RENDER', /Render \d+\//], ['SELESAI', /Selesai\./]],
   motion: [['NASKAH', /menulis naskah|naskah\//], ['SUARA', /Adegan \d+|VoxCPM2|\.wav:/], ['ANIMASI', /Render gaya/], ['RENDER', /Rendered|Encoding|Selesai:/], ['SELESAI', /Selesai:/]],
 };
+const WAKTU_LK = {};
+function lamaTahap(md) { const d = Math.max(0, Math.round(md / 1000)); return d < 60 ? d + ' dtk' : Math.floor(d / 60) + ' mnt ' + (d % 60) + ' dtk'; }
 function gambarLangkah(jenis, log, status) {
   const daftar = LK[jenis]; let sampai = -1;
   log.forEach((b) => daftar.forEach(([, re], i) => { if (re.test(b)) sampai = Math.max(sampai, i); }));
   if (status === 'selesai') sampai = daftar.length - 1;
+  const W = WAKTU_LK[jenis] = WAKTU_LK[jenis] || {mulai: Date.now(), t: []};
+  for (let i = 0; i <= Math.max(sampai, 0); i++) if (!W.t[i]) W.t[i] = i === 0 ? W.mulai : Date.now();
+  if (status !== 'jalan' && !W.akhir) W.akhir = Date.now();
+  const lama = (i) => W.t[i] ? lamaTahap((W.t[i + 1] || W.akhir || Date.now()) - W.t[i]) : '';
   const id = jenis === 'motion' ? 'Motion' : 'Klip';
-  $('#lk' + id).innerHTML = daftar.map(([n], i) => `<div class="lk ${i < sampai || status === 'selesai' ? 'beres' : i === sampai ? 'jalan' : ''}"><b>${String(i + 1).padStart(2, '0')} · ${n}</b>${i < sampai || status === 'selesai' ? 'Beres' : i === sampai ? (status === 'gagal' ? 'Gagal' : 'Berjalan…') : 'Menunggu'}</div>`).join('');
+  $('#lk' + id).innerHTML = daftar.map(([n], i) => `<div class="lk ${i < sampai || status === 'selesai' ? 'beres' : i === sampai ? 'jalan' : ''}"><b>${String(i + 1).padStart(2, '0')} · ${n}</b>${i < sampai || status === 'selesai' ? 'Beres · ' + lama(i) : i === sampai ? (status === 'gagal' ? 'Gagal' : 'Berjalan… ' + lama(i)) : 'Menunggu'}</div>`).join('');
   $('#batang' + id).style.width = (status === 'selesai' ? 100 : Math.max(6, ((sampai + 0.5) / daftar.length) * 100)) + '%';
   const lg = $('#log' + id); lg.textContent = log.join('\n'); lg.scrollTop = lg.scrollHeight;
 }
@@ -1181,7 +1188,7 @@ function mulaiPantau(jenis) {
   $('#proses' + id).classList.add('tampil');
   if (jenis !== 'render') $('#hasil' + id).classList.remove('tampil');
   if (jenis === 'klip') { $('#studioRender').classList.remove('tampil'); $('#h-klip').classList.remove('ada-hasil'); $('#sumberRingkas').hidden = true; window.perbaruiBarRender?.(); }
-  SIBUK = jenis; clearInterval(pantau); document.body.classList.add('bekerja');
+  SIBUK = jenis; clearInterval(pantau); document.body.classList.add('bekerja'); delete WAKTU_LK[jenis];
   let gagalPantau = 0;
   pantau = setInterval(async () => {
     let s;
@@ -1235,7 +1242,7 @@ $('#salinPrompt').onclick = (e) => { e.preventDefault(); salin(`Kamu penulis nas
 // hasil
 function tampilHasil(h) { if (!h) return; if (h.jenis === 'motion') return hasilMotion(h); hasilKlip(h); }
 // ── Klip: hasil analisis (kiri pemutar & ringkasan, kanan kartu klip) ──
-const KLIP = {h: null, pilih: new Set(), cari: '', filter: 0, urut: 'skor', judul: {}, aktif: null};
+const KLIP = {h: null, pilih: new Set(), cari: '', filter: 0, urut: 'skor', judul: {}, caption: {}, batas: {}, aktif: null};
 const pct = (x) => Math.round((x || 0) <= 1 ? (x || 0) * 100 : x);
 function ambilJejak(k) {
   if (!KLIP.h || !k) return; KLIP.jejak = KLIP.jejak || {};
@@ -1245,7 +1252,7 @@ function ambilJejak(k) {
 function hasilKlip(h) {
   const baru = !KLIP.h || KLIP.h.nama !== h.nama;
   KLIP.h = h;
-  if (baru) { KLIP.pilih = new Set((h.klip || []).map((k) => k.no)); KLIP.judul = {}; KLIP.aktif = null; KLIP.jejak = {}; if (h.gaya) terapkanGaya(h.gaya); }
+  if (baru) { KLIP.pilih = new Set((h.klip || []).map((k) => k.no)); KLIP.judul = {}; KLIP.caption = {}; KLIP.batas = {}; KLIP.aktif = null; KLIP.jejak = {}; if (h.gaya) terapkanGaya(h.gaya); }
   (h.klip || []).forEach((k) => { if (k.jejak) { KLIP.jejak = KLIP.jejak || {}; KLIP.jejak[k.no] = k.jejak; } });
   setTimeout(() => ambilJejak((h.klip || [])[0]), 0);
   const el = $('#hasilKlip'); const info = h.info || {}; const klips = h.klip || [];
@@ -1328,10 +1335,11 @@ function gambarKlip() {
     <div class="kartu k-kartu ${KLIP.pilih.has(k.no) ? 'dipilih' : ''}" id="kk-${k.no}">
       <div class="k-kepala"><input type="checkbox" data-c="${k.no}" ${KLIP.pilih.has(k.no) ? 'checked' : ''} title="centang untuk dirender">
         <h4>${k.no}. ${esc(k.judul)}</h4>${k.skor ? `<span class="lencana skor">${pct(k.skor)}% viral</span>` : ''}</div>
-      <div class="baris-meta" style="margin:10px 0"><span class="lencana">⏱ ${jam(k.mulai)} – ${jam(k.selesai)}</span><span class="lencana">${Math.round(k.selesai - k.mulai)} dtk</span><span class="lencana" style="color:var(--hijau)">hook ${jam(k.hook ?? k.mulai)}</span></div>
+      <div class="baris-meta" style="margin:10px 0">${(() => { const [a, b] = KLIP.batas[k.no] || [k.mulai, k.selesai]; const ubah = KLIP.batas[k.no] ? ' style="color:var(--aksen2)" title="batas diubah, render ulang untuk menerapkan"' : '';
+        return `<span class="lencana geser"${ubah}><button data-geser="${k.no}" data-ujung="0" data-d="-1" title="awal 1 dtk lebih dulu">◀</button>⏱ ${jam(a)}<button data-geser="${k.no}" data-ujung="0" data-d="1" title="awal 1 dtk lebih lambat">▶</button> – <button data-geser="${k.no}" data-ujung="1" data-d="-1" title="akhir 1 dtk lebih cepat">◀</button>${jam(b)}<button data-geser="${k.no}" data-ujung="1" data-d="1" title="akhir 1 dtk lebih panjang">▶</button></span><span class="lencana">${Math.round(b - a)} dtk</span>`; })()}<span class="lencana" style="color:var(--hijau)">hook ${jam(k.hook ?? k.mulai)}</span></div>
       ${k.kutipan ? `<div class="kutip">“${esc(k.kutipan.slice(0, 220))}${k.kutipan.length > 220 ? '…' : ''}”</div>` : ''}
       <div class="kotak"><b>JUDUL</b><span contenteditable="true" data-judul="${k.no}" title="ubah judul banner">${esc(KLIP.judul[k.no] ?? k.judul)}</span><button class="salin" data-s="${esc(k.judul)}">Salin</button></div>
-      <div class="kotak"><b>CAPTION</b><span>${esc(k.caption || k.judul)}</span><button class="salin" data-s="${esc(k.caption || k.judul)}">Salin</button></div>
+      <div class="kotak"><b>CAPTION</b><span contenteditable="true" data-caption="${k.no}" title="ubah caption">${esc(KLIP.caption[k.no] ?? (k.caption || k.judul))}</span><button class="salin" data-salin-caption="${k.no}">Salin</button></div>
       ${k.alasan ? `<div class="kotak"><b>ALASAN</b><span>${esc(k.alasan)}</span></div>` : ''}
       <div class="aksi"><button class="tombol utama kecil" data-putar="${k.no}">▶ Putar</button>
         <button class="tombol kedua kecil" data-s="${jam(k.mulai)} - ${jam(k.selesai)}">Salin timestamp</button>
@@ -1340,8 +1348,9 @@ function gambarKlip() {
         <button class="tombol kedua kecil" data-sub="${k.no}">✎ Edit subtitle</button></div>
       <div class="sunting-sub" id="ss-${k.no}" hidden></div>
       <div class="trans" id="tr-${k.no}">${esc(k.kutipan)}</div>
-      ${k.file ? `<div class="k-hasil"><video src="${base + k.file}?v=${Date.now()}" controls preload="metadata" playsinline></video><div><div class="eyebrow" style="margin-bottom:8px">sudah dirender</div>
-        <a class="tombol utama kecil" href="${base + k.file}" download data-jenis="klip" data-nama="${h.nama}" data-file="${k.file}">Unduh MP4</a></div></div>` : ''}
+      ${k.file ? `<div class="k-hasil"><video src="${base + k.file}?v=${Date.now()}"${k.sampul ? ` poster="${base + k.sampul}?v=${Date.now()}"` : ''} controls preload="metadata" playsinline></video><div><div class="eyebrow" style="margin-bottom:8px">sudah dirender</div>
+        <a class="tombol utama kecil" href="${base + k.file}" download data-jenis="klip" data-nama="${h.nama}" data-file="${k.file}">Unduh MP4</a>
+        ${k.sampul ? `<a class="tombol kedua kecil" href="${base + k.sampul}" download style="margin-top:8px">🖼 Unduh sampul</a>` : ''}</div></div>` : ''}
     </div>`).join('') : '<div class="kartu kosong"><b>Tidak ada klip yang cocok</b>Ubah kata kunci atau filter skor.</div>';
   $$('[data-c]').forEach((c) => c.onclick = (e) => { e.stopPropagation(); const n = +c.dataset.c; c.checked ? KLIP.pilih.add(n) : KLIP.pilih.delete(n); gambarKlip(); });
   $$('.ikh').forEach((it) => it.onclick = () => $('#kk-' + it.dataset.ke)?.scrollIntoView({behavior: 'smooth', block: 'center'}));
@@ -1364,6 +1373,15 @@ function gambarKlip() {
     } catch (e) { toast(e.message, true); }
   });
   $$('[data-judul]').forEach((sp) => sp.oninput = () => { KLIP.judul[sp.dataset.judul] = sp.textContent.trim(); gambarKanvas(); });
+  $$('[data-caption]').forEach((sp) => sp.oninput = () => { KLIP.caption[sp.dataset.caption] = sp.innerText.trim(); });
+  $$('[data-salin-caption]').forEach((b) => b.onclick = () => { const n = b.dataset.salinCaption; const k = klips.find((x) => x.no == n); salin(KLIP.caption[n] ?? (k.caption || k.judul)); });
+  $$('[data-geser]').forEach((b) => b.onclick = (e) => {
+    e.stopPropagation(); const n = +b.dataset.geser; const k = klips.find((x) => x.no === n);
+    const v = [...(KLIP.batas[n] || [k.mulai, k.selesai])]; const i = +b.dataset.ujung;
+    v[i] = Math.max(0, Math.round((v[i] + +b.dataset.d) * 10) / 10);
+    if (v[1] - v[0] < 3) return toast('Klip minimal 3 detik.', true);
+    KLIP.batas[n] = v; KLIP.pilih.add(n); gambarKlip();
+  });
   $$('[data-putar]').forEach((b) => b.onclick = () => {
     const k = klips.find((x) => x.no === +b.dataset.putar); const v = $('#vSumber'); if (!v) return;
     KLIP.aktif = k; v.currentTime = k.mulai; v.play(); ambilJejak(k);
@@ -1555,7 +1573,7 @@ function mulaiKanvas() { cancelAnimationFrame(animKanvas); const loop = () => { 
 $('#tblRender').onclick = async () => {
   if (!KLIP.h) return;
   try {
-    await api('/api/klip-render', {nama: KLIP.h.nama, pilih: [...KLIP.pilih], gaya: G, judul: KLIP.judul});
+    await api('/api/klip-render', {nama: KLIP.h.nama, pilih: [...KLIP.pilih], gaya: G, judul: KLIP.judul, caption: KLIP.caption, batas: KLIP.batas});
     toast(`Merender ${KLIP.pilih.size} klip…`); mulaiPantau('render');
     $('#prosesKlip').scrollIntoView({behavior: 'smooth', block: 'center'});
   } catch (e) { toast(e.message, true); }

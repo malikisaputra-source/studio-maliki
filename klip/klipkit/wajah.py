@@ -298,6 +298,18 @@ def potong_jejak(w: int, h: int, rasio: float, kunci: list[tuple[float, float]])
         x0 = int(min(max(kunci[0][1] * w - cw / 2, 0), w - cw))
         return f"crop={cw}:{ch}:{x0}:{(h - ch) // 2}"
     px = [(t, min(max(x * w - cw / 2, 0), w - cw)) for t, x in kunci]
+    # ffmpeg membatasi kedalaman ekspresi bertingkat: klip panjang dengan banyak pindah kamera gagal
+    # ("Missing ')' or too many args"). Buang titik yang tidak mengubah posisi, lalu batasi jumlah titik.
+    ringkas = [px[0]]
+    for i, p in enumerate(px[1:-1], 1):
+        if abs(p[1] - ringkas[-1][1]) > 2 or abs(px[i + 1][1] - p[1]) > 2:
+            ringkas.append(p)
+    ringkas.append(px[-1])
+    MAKS = 48
+    if len(ringkas) > MAKS:  # pertahankan titik awal/akhir, ambil sampel merata di antaranya
+        langkah = (len(ringkas) - 1) / (MAKS - 1)
+        ringkas = [ringkas[round(i * langkah)] for i in range(MAKS)]
+    px = ringkas
     # bangun ekspresi bertingkat: if(lt(t,t1), lerp, if(lt(t,t2), …))
     expr = f"{px[-1][1]:.1f}"
     for (t0, x0), (t1, x1) in reversed(list(zip(px, px[1:]))):

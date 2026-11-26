@@ -88,7 +88,7 @@ def transkrip(file: Path, model: str, bahasa: str | None) -> list[Kalimat]:
 # ── 3b. Transkrip lewat Gemini (tanpa faster-whisper; untuk worker web/VPS) ──────
 GEMINI_POTONG = 180  # detik per permintaan: waktu dari Gemini makin melenceng di audio panjang (uji: 10 mnt → -6 dtk)
 GEMINI_TEPI = 3      # detik tambahan di kedua sisi potongan supaya kalimat di batas tidak terpotong
-GEMINI_PARALEL = 3
+GEMINI_PARALEL = int(__import__("os").environ.get("GEMINI_PARALEL", "3"))  # Clipper web: 5–6 (potongan dikirim bersamaan)
 
 
 def _waktu(x) -> float:
@@ -223,10 +223,14 @@ def transkrip_gemini(file: Path, bahasa: str | None, kerja: Path, kunci: str | N
 
     # Waktu dari Gemini bisa melenceng puluhan detik → selaraskan teks tiap potongan ke audionya (forced alignment).
     pen = None
-    try:
+    import os
+    if os.environ.get("SELARAS_NANTI") == "1":
+        log("Penyelarasan waktu ditunda: hanya bagian yang jadi klip yang diselaraskan nanti.")
+    else:
+      try:
         from .selaras import Penyelaras, SR
         pen = Penyelaras()
-    except ImportError:
+      except ImportError:
         log("Penyelaras waktu tidak terpasang (butuh torch + torchaudio); memakai waktu kasar dari Gemini.")
     if pen:
         raw = subprocess.run([ffmpeg(), "-v", "error", "-i", str(file), "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
@@ -252,6 +256,70 @@ def transkrip_gemini(file: Path, bahasa: str | None, kerja: Path, kunci: str | N
             hasil.append(k)
     log(f"Transkrip Gemini: {len(hasil)} kalimat.")
     return hasil
+
+
+def baca_json3(p: Path) -> list[Kalimat]:
+    """Subtitle otomatis YouTube (json3): waktu per kata dari tOffsetMs; dipecah jadi kalimat ±12 kata / jeda >1 dtk."""
+    data = json.loads(p.read_text(encoding="utf-8"))
+    kata: list[Kata] = []
+    for ev in data.get("events", []):
+        t0 = ev.get("tStartMs", 0) / 1000
+        segs = [s for s in ev.get("segs") or [] if s.get("utf8", "").strip()]
+        for i, sg in enumerate(segs):
+            m = t0 + sg.get("tOffsetMs", 0) / 1000
+            for w in sg["utf8"].split():
+                kata.append(Kata(round(m, 3), round(m + 0.3, 3), w))
+    for i in range(len(kata) - 1):  # akhir kata = awal kata berikut (maks 1 dtk)
+        kata[i].selesai = round(min(kata[i + 1].mulai, kata[i].mulai + 1.0), 3)
+    # sebagian video punya caption bertanda baca (buatan kreator/YouTube terbaru): jangan diubah
+    tanda = sum(1 for w in kata if w.teks[-1:] in ".,?!") / max(len(kata), 1)
+    polos = tanda < 0.02
+    hasil, buf, awal_kalimat = [], [], True
+    for i, w in enumerate(kata):
+        buf.append(w)
+        jeda = kata[i + 1].mulai - w.selesai if i + 1 < len(kata) else 9
+        if len(buf) >= 12 or jeda > 0.8:
+            if polos:
+                _rapikan(buf, kapital=awal_kalimat, akhir=jeda > 0.8)
+                awal_kalimat = jeda > 0.8
+            hasil.append(Kalimat(buf[0].mulai, buf[-1].selesai, " ".join(x.teks for x in buf), buf))
+            buf = []
+    return hasil
+
+
+_TANYA = {"apa", "apakah", "kenapa", "mengapa", "gimana", "bagaimana", "siapa", "kapan", "dimana", "di mana",
+          "berapa", "kok", "masa", "emang", "benarkah", "bisakah"}
+
+
+def _rapikan(buf: list[Kata], kapital: bool, akhir: bool) -> None:
+    """Subtitle otomatis YouTube tanpa huruf kapital & tanda baca: kapitalkan awal kalimat, beri '.'/'?' di akhir
+    kalimat (jeda panjang), dan rapikan 'i' Inggris tunggal tidak disentuh (bahasa Indonesia)."""
+    if not buf:
+        return
+    w0 = buf[0].teks
+    if kapital and w0[:1].isalpha() and w0[:1].islower():
+        buf[0].teks = w0[:1].upper() + w0[1:]
+    if akhir and buf[-1].teks[-1:].isalnum():
+        tanya = buf[0].teks.lower().strip(",.") in _TANYA or buf[-1].teks.lower() in {"ya", "nggak", "enggak", "gak", "kan", "toh"} and len(buf) > 3 and buf[0].teks.lower() in _TANYA
+        buf[-1].teks += "?" if tanya else "."
+
+
+def selaraskan_bagian(file: Path, kal: list[Kalimat], rentang: list[tuple[float, float]]) -> int:
+    """Selaraskan waktu hanya untuk kalimat di sekitar klip terpilih (mode SELARAS_NANTI). Jendela audio dilebarkan
+    ±60 dtk karena waktu kasar Gemini bisa melenceng puluhan detik. Kembalikan jumlah kalimat yang diselaraskan."""
+    try:
+        from .selaras import Penyelaras, SR
+    except ImportError:
+        return 0
+    pen, ok = Penyelaras(), 0
+    raw = subprocess.run([ffmpeg(), "-v", "error", "-i", str(file), "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
+                         capture_output=True, check=True).stdout
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768
+    for a, b in rentang:
+        isi = [k for k in kal if k.selesai > a - 5 and k.mulai < b + 5]
+        if isi:
+            ok += pen.selaraskan(audio, isi, isi[0].mulai - 60, isi[-1].selesai + 60)
+    return ok
 
 
 # ── 8. Subtitle dari berkas .srt & rentang ──────────────────────────────────
